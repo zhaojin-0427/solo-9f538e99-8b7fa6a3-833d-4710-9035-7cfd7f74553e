@@ -96,6 +96,34 @@ def normalize_manifest(rows) -> list[Partition]:
     return parts
 
 
+def _canonical_partitions(partitions: list[Partition]) -> list[dict]:
+    """规范化分区行并排序：同一清单无论行序如何都得到同一序列。"""
+    return sorted(
+        (
+            {
+                "partition_key": p.partition_key,
+                "entity": p.entity,
+                "bytes": p.bytes,
+                "records": p.records,
+            }
+            for p in partitions
+        ),
+        key=lambda d: (d["entity"], d["partition_key"], d["bytes"], d["records"]),
+    )
+
+
+def manifest_identity(partitions: list[Partition]) -> str:
+    """只对规范化清单本身计算指纹（不含 worker 参数）。
+
+    分区排序后哈希，因此同一清单即使行顺序不同、worker 参数不同，
+    也会得到同一身份指纹——用于跨参数复用已发布分配与无解依据。
+    """
+    blob = json.dumps(
+        _canonical_partitions(partitions), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 def manifest_fingerprint(partitions: list[Partition], worker_count: int, worker_byte_limit: int) -> str:
     """对规范化后的清单 + 参数计算稳定指纹。
 
@@ -105,18 +133,7 @@ def manifest_fingerprint(partitions: list[Partition], worker_count: int, worker_
     canon = {
         "worker_count": worker_count,
         "worker_byte_limit": worker_byte_limit,
-        "partitions": sorted(
-            (
-                {
-                    "partition_key": p.partition_key,
-                    "entity": p.entity,
-                    "bytes": p.bytes,
-                    "records": p.records,
-                }
-                for p in partitions
-            ),
-            key=lambda d: (d["entity"], d["partition_key"], d["bytes"], d["records"]),
-        ),
+        "partitions": _canonical_partitions(partitions),
     }
     blob = json.dumps(canon, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
@@ -130,6 +147,53 @@ def aggregate_entities(partitions: list[Partition]) -> dict[str, list[int]]:
         slot[0] += p.bytes
         slot[1] += p.records
     return dict(sorted(agg.items()))
+
+
+def capacity_precheck(entity_agg: dict[str, list[int]], worker_count: int,
+                      worker_byte_limit: int) -> Optional[PlanResult]:
+    """按本次参数判定单实体超限与总容量（分片）超限；通过则返回 None。
+
+    这两项只取决于本次参数与清单聚合结果，不依赖历史，因此在查任何
+    复用依据之前先判，命中即直接拒绝。
+    """
+    too_big = {e: b for e, (b, _r) in entity_agg.items() if b > worker_byte_limit}
+    if too_big:
+        return PlanResult(
+            False,
+            SINGLE_ENTITY_OVERFLOW,
+            {
+                "entities": [{"entity": e, "bytes": b} for e, b in sorted(too_big.items())],
+                "worker_byte_limit": worker_byte_limit,
+            },
+        )
+
+    total_bytes = sum(b for b, _r in entity_agg.values())
+    total_capacity = worker_count * worker_byte_limit
+    if total_bytes > total_capacity:
+        return PlanResult(
+            False,
+            CAPACITY_OVERFLOW,
+            {
+                "total_bytes": total_bytes,
+                "worker_count": worker_count,
+                "worker_byte_limit": worker_byte_limit,
+                "total_capacity": total_capacity,
+            },
+        )
+    return None
+
+
+def reuse_assignment(basis_shards: list[list[str]], worker_count: int) -> Optional[list[list[str]]]:
+    """把依据计划的实体分配（非空分片，按原分片下标升序）套用到本次 worker 数。
+
+    非空分片数不超过本次 worker 数时，尾部补空分片；否则返回 None。
+    沿用的只是“实体→分片”的分组，不触碰依据计划的任何分区明细。
+    """
+    if len(basis_shards) > worker_count:
+        return None
+    shards = [list(entities) for entities in basis_shards]
+    shards.extend([] for _ in range(worker_count - len(shards)))
+    return shards
 
 
 def _ffd(sizes: list[int], order: list[int], remaining: list[int], bins: list[list[int]]) -> bool:
@@ -206,30 +270,9 @@ def build_plan(partitions: list[Partition], worker_count: int, worker_byte_limit
     """
     entity_agg = aggregate_entities(partitions)
 
-    too_big = {e: b for e, (b, _r) in entity_agg.items() if b > worker_byte_limit}
-    if too_big:
-        return PlanResult(
-            False,
-            SINGLE_ENTITY_OVERFLOW,
-            {
-                "entities": [{"entity": e, "bytes": b} for e, b in sorted(too_big.items())],
-                "worker_byte_limit": worker_byte_limit,
-            },
-        )
-
-    total_bytes = sum(b for b, _r in entity_agg.values())
-    total_capacity = worker_count * worker_byte_limit
-    if total_bytes > total_capacity:
-        return PlanResult(
-            False,
-            CAPACITY_OVERFLOW,
-            {
-                "total_bytes": total_bytes,
-                "worker_count": worker_count,
-                "worker_byte_limit": worker_byte_limit,
-                "total_capacity": total_capacity,
-            },
-        )
+    precheck = capacity_precheck(entity_agg, worker_count, worker_byte_limit)
+    if precheck is not None:
+        return precheck
 
     names = sorted(entity_agg)
     sizes = [entity_agg[n][0] for n in names]
@@ -245,7 +288,7 @@ def build_plan(partitions: list[Partition], worker_count: int, worker_byte_limit
                 "entity_count": len(names),
                 "worker_count": worker_count,
                 "worker_byte_limit": worker_byte_limit,
-                "total_bytes": total_bytes,
+                "total_bytes": sum(b for b, _r in entity_agg.values()),
             },
         )
     shards = [[names[i] for i in bin_indices] for bin_indices in assignment]

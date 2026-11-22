@@ -12,6 +12,15 @@
     <div><dt>总字节</dt><dd>{{ plan.total_bytes|human_bytes }}（{{ plan.total_bytes }} 字节）</dd></div>
     <div><dt>总记录数</dt><dd>{{ plan.total_records }}</dd></div>
   </dl>
+  {% if plan.basis_plan_id %}
+  <div class="flash flash-info">
+    本计划沿用已发布计划 <a href="{{ url_for('planner.view_plan', plan_id=plan.basis_plan_id) }}">#{{ plan.basis_plan_id }}</a>
+    的实体分配发布：依据计划的非空分片数（{{ plan.non_empty_shards }}）与最重分片字节
+    （{{ plan.max_shard_bytes }}）均符合本次规格，未重跑装箱、未扫描旧分区明细。
+  </div>
+  {% else %}
+  <div class="flash flash-success">本计划由本次参数重新求解得到。</div>
+  {% endif %}
   <p><a class="button" href="{{ url_for('planner.export_plan', plan_id=plan.id) }}">导出 JSON（交给并行作业）</a></p>
 </section>
 

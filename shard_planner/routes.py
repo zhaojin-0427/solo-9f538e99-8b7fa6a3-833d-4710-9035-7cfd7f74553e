@@ -27,9 +27,13 @@ from .planner import (
     SINGLE_ENTITY_OVERFLOW,
     SOLVER_LIMIT,
     ManifestError,
+    aggregate_entities,
     build_plan,
+    capacity_precheck,
     manifest_fingerprint,
+    manifest_identity,
     normalize_manifest,
+    reuse_assignment,
 )
 
 bp = Blueprint("planner", __name__)
@@ -100,9 +104,18 @@ def _reason_message(reason: str, detail: dict) -> str:
             f"（每 worker 上限 {detail['worker_byte_limit']}），未发布计划。"
         )
     if reason == NO_FEASIBLE_COMBINATION:
+        if detail.get("evidence"):
+            ev = detail["evidence"]
+            return (
+                f"无可行组合：同一清单曾在规格 worker 数 {ev['worker_count']}、"
+                f"单 worker 字节上限 {ev['worker_byte_limit']}（依据编号 #{ev['id']}）下"
+                "证实找不到可行分配；该规格的 worker 数与字节上限都不低于本次参数，"
+                "本次只会更紧，因此直接判定无可行组合，未重跑装箱、未发布计划。"
+            )
         return (
             "无可行组合：总字节在总容量之内，但受“同一实体不可拆分”约束，"
             "找不到让每个分片都不超限的分配方案，未发布计划。"
+            "该规格已作为无解依据留存，后续更紧的参数可直接复用此结论。"
         )
     if reason == SOLVER_LIMIT:
         return "求解超时：未能在限定步数内判定可行性，未发布计划。"
@@ -141,22 +154,79 @@ def create_plan():
     except ManifestError as exc:
         return _render_index(error=str(exc), status=400)
 
+    manifest_key = manifest_identity(partitions)
     fingerprint = manifest_fingerprint(partitions, worker_count, worker_byte_limit)
     db = get_db()
 
-    # 同一清单（含参数）重试：直接返回原计划
+    # 同一清单（含参数）重试：直接返回原计划（参数也相同就返回原编号）
     existing = store.find_plan_by_hash(db, fingerprint)
     if existing is not None:
         flash(f"相同清单与参数已发布过，返回原计划 #{existing['id']}。", "info")
         return redirect(url_for("planner.view_plan", plan_id=existing["id"]))
 
+    # 先按本次参数判断单实体和总容量是否超限（不看任何历史依据）
+    entity_agg = aggregate_entities(partitions)
+    precheck = capacity_precheck(entity_agg, worker_count, worker_byte_limit)
+    if precheck is not None:
+        return _render_index(error=_reason_message(precheck.reason, precheck.detail or {}), status=422)
+
+    # 复用同一清单的已发布分配：非空分片数与最重分片字节都符合本次规格即沿用
+    reusable = store.find_reusable_plan(db, manifest_key, worker_count, worker_byte_limit)
+    if reusable is not None:
+        basis_assignment = store.get_plan_entity_assignment(db, reusable["id"])
+        shards = reuse_assignment(basis_assignment, worker_count)
+        # 摘要列已保证非空分片数与最重分片合规；防御性校验，异常则回退正常求解
+        if shards is not None and all(
+            sum(entity_agg[e][0] for e in entities) <= worker_byte_limit
+            for entities in shards
+        ):
+            try:
+                plan_id = store.create_plan(
+                    db, fingerprint, manifest_key, worker_count, worker_byte_limit,
+                    partitions, shards, basis_plan_id=reusable["id"],
+                )
+            except sqlite3.IntegrityError:
+                # 并发下另一个请求已发布同一清单+参数：返回原计划
+                existing = store.find_plan_by_hash(db, fingerprint)
+                flash(f"相同清单与参数已发布过，返回原计划 #{existing['id']}。", "info")
+                return redirect(url_for("planner.view_plan", plan_id=existing["id"]))
+            flash(
+                f"计划 #{plan_id} 已发布：复用已发布计划 #{reusable['id']} 的实体分配"
+                "（非空分片数与最重分片均符合本次规格），未重跑装箱。",
+                "success",
+            )
+            return redirect(url_for("planner.view_plan", plan_id=plan_id))
+
+    # 复用无解依据：同清单曾在不弱于本次的规格下证实无可行组合
+    evidence = store.find_dominating_infeasible_evidence(
+        db, manifest_key, worker_count, worker_byte_limit
+    )
+    if evidence is not None:
+        detail = {
+            "evidence": {
+                "id": evidence["id"],
+                "worker_count": evidence["worker_count"],
+                "worker_byte_limit": evidence["worker_byte_limit"],
+            }
+        }
+        return _render_index(
+            error=_reason_message(NO_FEASIBLE_COMBINATION, detail), status=422
+        )
+
+    # 找不到依据，照常求解
     result = build_plan(partitions, worker_count, worker_byte_limit)
     if not result.ok:
+        # 只有真正证实的无可行组合才登记为依据；求解超时（SOLVER_LIMIT）不登记
+        if result.reason == NO_FEASIBLE_COMBINATION:
+            store.insert_infeasible_evidence(
+                db, manifest_key, worker_count, worker_byte_limit
+            )
         return _render_index(error=_reason_message(result.reason, result.detail or {}), status=422)
 
     try:
         plan_id = store.create_plan(
-            db, fingerprint, worker_count, worker_byte_limit, partitions, result.shards
+            db, fingerprint, manifest_key, worker_count, worker_byte_limit,
+            partitions, result.shards
         )
     except sqlite3.IntegrityError:
         # 并发下另一个请求已发布同一清单：返回原计划
@@ -164,7 +234,7 @@ def create_plan():
         flash(f"相同清单与参数已发布过，返回原计划 #{existing['id']}。", "info")
         return redirect(url_for("planner.view_plan", plan_id=existing["id"]))
 
-    flash(f"计划 #{plan_id} 已发布。", "success")
+    flash(f"计划 #{plan_id} 已发布（本次新求解）。", "success")
     return redirect(url_for("planner.view_plan", plan_id=plan_id))
 
 

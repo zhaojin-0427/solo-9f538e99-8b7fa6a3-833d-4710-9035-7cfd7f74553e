@@ -47,7 +47,7 @@
     <thead>
       <tr>
         <th>ID</th><th>创建时间 (UTC)</th><th>worker 数</th><th>单 worker 上限</th>
-        <th>实体数</th><th>分区数</th><th>总字节</th><th>总记录数</th><th></th>
+        <th>实体数</th><th>分区数</th><th>总字节</th><th>总记录数</th><th>来源</th><th></th>
       </tr>
     </thead>
     <tbody>
@@ -61,6 +61,13 @@
         <td>{{ p.partition_count }}</td>
         <td>{{ p.total_bytes|human_bytes }}</td>
         <td>{{ p.total_records }}</td>
+        <td>
+          {% if p.basis_plan_id %}
+            复用 <a href="{{ url_for('planner.view_plan', plan_id=p.basis_plan_id) }}">#{{ p.basis_plan_id }}</a>
+          {% else %}
+            新求解
+          {% endif %}
+        </td>
         <td><a href="{{ url_for('planner.view_plan', plan_id=p.id) }}">查看</a></td>
       </tr>
       {% endfor %}
